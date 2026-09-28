@@ -50,9 +50,19 @@ def update_ema(ema_model, model, decay=0.9999):
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
 
+    if os.environ.get('NWM_OPT_6', '0') != '1':
+        for name, param in model_params.items():
+            name = name.replace('_orig_mod.', '')
+            ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        return
+
+    ema_list, param_list = [], []
     for name, param in model_params.items():
         name = name.replace('_orig_mod.', '')
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        ema_list.append(ema_params[name])
+        param_list.append(param.data)
+    torch._foreach_mul_(ema_list, decay)
+    torch._foreach_add_(ema_list, param_list, alpha=1 - decay)
 
 
 def requires_grad(model, flag=True):
@@ -122,8 +132,14 @@ def main(args):
     else:
         logger = create_logger(None)
 
+    torch.backends.cudnn.benchmark = os.environ.get('NWM_OPT_7', '0') == '1'
+
     # Create model:
     tokenizer = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    if os.environ.get('NWM_OPT_8', '0') == '1':
+        tokenizer = tokenizer.to(memory_format=torch.channels_last)
+    if os.environ.get('NWM_OPT_9', '0') == '1':
+        tokenizer.encoder = torch.compile(tokenizer.encoder)
     latent_size = config['image_size'] // 8
 
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -135,7 +151,8 @@ def main(args):
     
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0,
+                            fused=os.environ.get('NWM_OPT_10', '0') == '1')
 
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:

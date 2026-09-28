@@ -11,6 +11,7 @@
 
 
 import math
+import os
 
 import numpy as np
 import torch as th
@@ -184,6 +185,7 @@ class GaussianDiffusion:
         assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.log_betas = np.log(betas)
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
         self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
@@ -292,7 +294,9 @@ class GaussianDiffusion:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            max_log = _extract_into_tensor(
+                self.log_betas if _fast_schedule() else np.log(self.betas), t, x.shape
+            )
             # The model_var_values is [-1, 1] for [min_var, max_var].
             frac = (model_var_values + 1) / 2
             model_log_variance = frac * max_log + (1 - frac) * min_log
@@ -864,6 +868,25 @@ class GaussianDiffusion:
         }
 
 
+def _fast_schedule():
+    return os.environ.get("NWM_OPT_1", '1') == "1"
+
+# Device copies of the (constant) schedule arrays, keyed by array identity and
+# device. The array itself is kept in the value so its id() cannot be recycled.
+_OPT_12 = {}
+
+
+def _opt_11(arr, device):
+    key = (id(arr), device)
+    hit = _OPT_12.get(key)
+    if hit is None:
+        if len(_OPT_12) > 64:  # callers that build arrays on the fly
+            _OPT_12.clear()
+        hit = (arr, th.from_numpy(arr).to(device=device))
+        _OPT_12[key] = hit
+    return hit[1]
+
+
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """
     Extract values from a 1-D numpy array for a batch of indices.
@@ -873,7 +896,12 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
                             dimension equal to the length of timesteps.
     :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
     """
-    res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    if not _fast_schedule():
+        res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res + th.zeros(broadcast_shape, device=timesteps.device)
+    res = _opt_11(arr, timesteps.device)[timesteps].float()
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
-    return res + th.zeros(broadcast_shape, device=timesteps.device)
+    return res.expand(broadcast_shape)

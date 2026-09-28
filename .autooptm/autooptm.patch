@@ -1,0 +1,241 @@
+diff --git a/diffusion/gaussian_diffusion.py b/diffusion/gaussian_diffusion.py
+index 347d2c2..af60c96 100644
+--- a/diffusion/gaussian_diffusion.py
++++ b/diffusion/gaussian_diffusion.py
+@@ -11,6 +11,7 @@
+ 
+ 
+ import math
++import os
+ 
+ import numpy as np
+ import torch as th
+@@ -184,6 +185,7 @@ class GaussianDiffusion:
+         assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
+ 
+         # calculations for diffusion q(x_t | x_{t-1}) and others
++        self.log_betas = np.log(betas)
+         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+         self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
+@@ -292,7 +294,9 @@ class GaussianDiffusion:
+             assert model_output.shape == (B, C * 2, *x.shape[2:])
+             model_output, model_var_values = th.split(model_output, C, dim=1)
+             min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
++            max_log = _extract_into_tensor(
++                self.log_betas if _fast_schedule() else np.log(self.betas), t, x.shape
++            )
+             # The model_var_values is [-1, 1] for [min_var, max_var].
+             frac = (model_var_values + 1) / 2
+             model_log_variance = frac * max_log + (1 - frac) * min_log
+@@ -864,6 +868,25 @@ class GaussianDiffusion:
+         }
+ 
+ 
++def _fast_schedule():
++    return os.environ.get("NWM_OPT_1", '1') == "1"
++
++# Device copies of the (constant) schedule arrays, keyed by array identity and
++# device. The array itself is kept in the value so its id() cannot be recycled.
++_OPT_12 = {}
++
++
++def _opt_11(arr, device):
++    key = (id(arr), device)
++    hit = _OPT_12.get(key)
++    if hit is None:
++        if len(_OPT_12) > 64:  # callers that build arrays on the fly
++            _OPT_12.clear()
++        hit = (arr, th.from_numpy(arr).to(device=device))
++        _OPT_12[key] = hit
++    return hit[1]
++
++
+ def _extract_into_tensor(arr, timesteps, broadcast_shape):
+     """
+     Extract values from a 1-D numpy array for a batch of indices.
+@@ -873,7 +896,12 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
+                             dimension equal to the length of timesteps.
+     :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+     """
+-    res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
++    if not _fast_schedule():
++        res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
++        while len(res.shape) < len(broadcast_shape):
++            res = res[..., None]
++        return res + th.zeros(broadcast_shape, device=timesteps.device)
++    res = _opt_11(arr, timesteps.device)[timesteps].float()
+     while len(res.shape) < len(broadcast_shape):
+         res = res[..., None]
+-    return res + th.zeros(broadcast_shape, device=timesteps.device)
++    return res.expand(broadcast_shape)
+diff --git a/diffusion/respace.py b/diffusion/respace.py
+index 12cf0c8..8cd5cbd 100644
+--- a/diffusion/respace.py
++++ b/diffusion/respace.py
+@@ -9,11 +9,16 @@
+ #     ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
+ #     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+ 
++import os
++
+ import numpy as np
+ import torch as th
+ 
+ from .gaussian_diffusion import GaussianDiffusion
+ 
++def _opt_13():
++    return os.environ.get("NWM_OPT_2", '1') == "1"
++
+ 
+ def space_timesteps(num_timesteps, section_counts):
+     """
+@@ -126,9 +131,13 @@ class _WrappedModel:
+         self.timestep_map = timestep_map
+         # self.rescale_timesteps = rescale_timesteps
+         self.original_num_steps = original_num_steps
++        self._map_tensor = None
+ 
+     def __call__(self, x, ts, **kwargs):
+-        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
++        map_tensor = self._map_tensor if _opt_13() else None
++        if map_tensor is None or map_tensor.device != ts.device or map_tensor.dtype != ts.dtype:
++            map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
++            self._map_tensor = map_tensor
+         new_ts = map_tensor[ts]
+         # if self.rescale_timesteps:
+         #     new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
+diff --git a/models.py b/models.py
+index e2613fc..5ffabb6 100644
+--- a/models.py
++++ b/models.py
+@@ -8,12 +8,21 @@
+ # GLIDE: https://github.com/openai/glide-text2im
+ # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
+ # --------------------------------------------------------
++import os
++
+ import torch
+ import torch.nn as nn
+ import numpy as np
+ import math
+ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+ 
++def _flag(name, default="0"):
++    return os.environ.get(name, default) == "1"
++
++
++# Constant sinusoidal frequency table, keyed by (half, max_period, device).
++_OPT_14 = {}
++
+ 
+ def modulate(x, shift, scale):
+     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+@@ -48,9 +57,15 @@ class TimestepEmbedder(nn.Module):
+         """
+         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+         half = dim // 2
+-        freqs = torch.exp(
+-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+-        ).to(device=t.device)
++        key = (half, max_period, t.device)
++        opt_15 = _flag("NWM_OPT_3", '1')
++        freqs = _OPT_14.get(key) if opt_15 else None
++        if freqs is None:
++            freqs = torch.exp(
++                -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
++            ).to(device=t.device)
++            if opt_15:
++                _OPT_14[key] = freqs
+         args = t.float() * freqs[None]
+         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+         if dim % 2:
+@@ -101,10 +116,12 @@ class CDiTBlock(nn.Module):
+         approx_gelu = lambda: nn.GELU(approximate="tanh")
+         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+ 
+-    def forward(self, x, c, x_cond):
++    def forward(self, x, c, x_cond, x_cond_normed=None):
+         shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(11, dim=1)
+         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+-        x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
++        if x_cond_normed is None:
++            x_cond_normed = self.norm_cond(x_cond)
++        x_cond_norm = modulate(x_cond_normed, shift_ca_xcond, scale_ca_xcond)
+         x = x + gate_ca_x.unsqueeze(1) * self.cttn(query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), key=x_cond_norm, value=x_cond_norm, need_weights=False)[0]
+         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+         return x
+@@ -158,6 +175,9 @@ class CDiT(nn.Module):
+         num_patches = self.x_embedder.num_patches
+         self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
+         self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
++        if _flag("NWM_OPT_4", '1'):
++            for b in self.blocks:
++                b.compile()
+         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+         self.time_embedder = TimestepEmbedder(hidden_size)
+         self.initialize_weights()
+@@ -238,8 +258,11 @@ class CDiT(nn.Module):
+         time_emb = self.time_embedder(rel_t[..., None])
+         c = t + time_emb + y # if training on unlabeled data, dont add y.
+ 
++        # Every block's norm_cond is the same parameter-free LayerNorm applied to
++        # the same x_cond, so it can be computed once for all of them.
++        x_cond_normed = self.blocks[0].norm_cond(x_cond) if _flag("NWM_OPT_5", '1') else None
+         for block in self.blocks:
+-            x = block(x, c, x_cond)
++            x = block(x, c, x_cond, x_cond_normed)
+         x = self.final_layer(x, c)
+         x = self.unpatchify(x)
+         return x
+diff --git a/train.py b/train.py
+index b6fe150..6788c94 100644
+--- a/train.py
++++ b/train.py
+@@ -50,9 +50,19 @@ def update_ema(ema_model, model, decay=0.9999):
+     ema_params = OrderedDict(ema_model.named_parameters())
+     model_params = OrderedDict(model.named_parameters())
+ 
++    if os.environ.get('NWM_OPT_6', '0') != '1':
++        for name, param in model_params.items():
++            name = name.replace('_orig_mod.', '')
++            ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
++        return
++
++    ema_list, param_list = [], []
+     for name, param in model_params.items():
+         name = name.replace('_orig_mod.', '')
+-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
++        ema_list.append(ema_params[name])
++        param_list.append(param.data)
++    torch._foreach_mul_(ema_list, decay)
++    torch._foreach_add_(ema_list, param_list, alpha=1 - decay)
+ 
+ 
+ def requires_grad(model, flag=True):
+@@ -122,8 +132,14 @@ def main(args):
+     else:
+         logger = create_logger(None)
+ 
++    torch.backends.cudnn.benchmark = os.environ.get('NWM_OPT_7', '0') == '1'
++
+     # Create model:
+     tokenizer = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
++    if os.environ.get('NWM_OPT_8', '0') == '1':
++        tokenizer = tokenizer.to(memory_format=torch.channels_last)
++    if os.environ.get('NWM_OPT_9', '0') == '1':
++        tokenizer.encoder = torch.compile(tokenizer.encoder)
+     latent_size = config['image_size'] // 8
+ 
+     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+@@ -135,7 +151,8 @@ def main(args):
+     
+     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+     lr = float(config.get('lr', 1e-4))
+-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
++    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0,
++                            fused=os.environ.get('NWM_OPT_10', '0') == '1')
+ 
+     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
+     if bfloat_enable:

@@ -9,10 +9,15 @@
 #     ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
 #     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
 
+import os
+
 import numpy as np
 import torch as th
 
 from .gaussian_diffusion import GaussianDiffusion
+
+def _opt_13():
+    return os.environ.get("NWM_OPT_2", '1') == "1"
 
 
 def space_timesteps(num_timesteps, section_counts):
@@ -126,9 +131,13 @@ class _WrappedModel:
         self.timestep_map = timestep_map
         # self.rescale_timesteps = rescale_timesteps
         self.original_num_steps = original_num_steps
+        self._map_tensor = None
 
     def __call__(self, x, ts, **kwargs):
-        map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        map_tensor = self._map_tensor if _opt_13() else None
+        if map_tensor is None or map_tensor.device != ts.device or map_tensor.dtype != ts.dtype:
+            map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+            self._map_tensor = map_tensor
         new_ts = map_tensor[ts]
         # if self.rescale_timesteps:
         #     new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
